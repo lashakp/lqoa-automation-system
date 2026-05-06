@@ -1,43 +1,79 @@
-import sqlite3
 import json
 import logging
 import numpy as np
 import faiss
 from pathlib import Path
-from sentence_transformers import SentenceTransformer
-import torch
 from typing import Optional, Tuple, List
+
 from pipeline.api.dependencies.database import get_connection
 
-
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-DB_PATH = BASE_DIR / "pipeline" / "ingestion" / "data" / "yc_database.db"
 INDEX_PATH = BASE_DIR / "pipeline" / "indexing" / "faiss_index.bin"
 ID_MAP_PATH = BASE_DIR / "pipeline" / "indexing" / "id_map.json"
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = model.to(device)
+# =========================
+# LAZY LOAD GLOBALS
+# =========================
 
-index = faiss.read_index(str(INDEX_PATH))
+_model = None
+_index = None
+_id_map = None
 
-with open(ID_MAP_PATH, "r") as f:
-    id_map = json.load(f)
 
-logger.info(f"Index loaded with {index.ntotal} vectors")
+def get_model():
+    global _model
+
+    if _model is None:
+        logger.info("Loading embedding model...")
+        from sentence_transformers import SentenceTransformer
+
+        _model = SentenceTransformer("all-MiniLM-L6-v2")
+
+    return _model
+
+
+def get_index():
+    global _index
+
+    if _index is None:
+        logger.info("Loading FAISS index...")
+        _index = faiss.read_index(str(INDEX_PATH))
+
+    return _index
+
+
+def get_id_map():
+    global _id_map
+
+    if _id_map is None:
+        logger.info("Loading ID map...")
+        with open(ID_MAP_PATH, "r") as f:
+            _id_map = json.load(f)
+
+    return _id_map
+
+
+# =========================
+# HELPERS
+# =========================
 
 def clean_summary(summary):
     if not summary or summary in ["Fetch Error", "Error", "None", "null", ""]:
         return "No summary available"
     return summary.strip()
 
+
 def clean_location(location):
     if not location:
         return "Location not specified"
     return location
+
+
+# =========================
+# DB FETCH
+# =========================
 
 def fetch_companies_by_ids(
     ids: list,
@@ -56,7 +92,7 @@ def fetch_companies_by_ids(
     params = list(ids)
 
     query = f"""
-        SELECT id, name, industries, batch, location, 
+        SELECT id, name, industries, batch, location,
                website_summary, lead_score
         FROM yc_companies
         WHERE id IN ({placeholders})
@@ -80,17 +116,20 @@ def fetch_companies_by_ids(
     warning = None
 
     if len(rows) == 0 and any([industry, batch, location]):
-        warning = "No exact matches found for all your filters. Showing the best semantic matches instead."
+        warning = "No exact matches found for all filters. Showing fallback results."
 
-        # Fallback: remove filters
-        query = f"""
-            SELECT id, name, industries, batch, location, 
+        cursor.execute(
+            f"""
+            SELECT id, name, industries, batch, location,
                    website_summary, lead_score
             FROM yc_companies
             WHERE id IN ({placeholders})
-        """
-        cursor.execute(query, list(ids))
+            """,
+            list(ids)
+        )
         rows = cursor.fetchall()
+
+    conn.close()
 
     companies = []
     for row in rows:
@@ -104,9 +143,12 @@ def fetch_companies_by_ids(
             "lead_score": float(row[6]) if row[6] is not None else 0.0,
         })
 
-    conn.close()
     return companies, warning
 
+
+# =========================
+# MAIN SEARCH
+# =========================
 
 def semantic_search(
     query: str,
@@ -121,54 +163,36 @@ def semantic_search(
 ) -> Tuple[List, Optional[str], int]:
 
     logger.info(f"Searching for: {query}")
-    logger.info(f"Access mode: {mode}")
+    logger.info(f"Mode: {mode}")
 
     # -----------------------------
-    # Demo Mode Restrictions
+    # Demo Mode Limits
     # -----------------------------
-
     if mode == "demo":
-
-        DEMO_MAX_LIMIT = 15
-        DEMO_MAX_OFFSET = 10
-
-        if limit > DEMO_MAX_LIMIT:
-
-            logger.info(
-                f"Demo mode limit capped from {limit} to {DEMO_MAX_LIMIT}"
-            )
-
-            limit = DEMO_MAX_LIMIT
-
-        if offset > DEMO_MAX_OFFSET:
-
-            logger.info(
-                f"Demo mode offset capped from {offset} to {DEMO_MAX_OFFSET}"
-            )
-
-            offset = DEMO_MAX_OFFSET
+        limit = min(limit, 15)
+        offset = min(offset, 10)
 
     # -----------------------------
-    # Embedding
+    # LOAD RESOURCES (lazy)
     # -----------------------------
+    model = get_model()
+    index = get_index()
+    id_map = get_id_map()
 
+    # -----------------------------
+    # EMBEDDING
+    # -----------------------------
     query_embedding = model.encode(
         query,
         convert_to_numpy=True
     ).astype("float32")
 
-    faiss.normalize_L2(
-        query_embedding.reshape(1, -1)
-    )
+    faiss.normalize_L2(query_embedding.reshape(1, -1))
 
     # -----------------------------
-    # Retrieval Size
+    # SEARCH
     # -----------------------------
-
-    search_k = max(
-        (offset + limit) * 5,
-        20
-    )
+    search_k = max((offset + limit) * 5, 20)
 
     scores, indices = index.search(
         query_embedding.reshape(1, -1),
@@ -176,11 +200,8 @@ def semantic_search(
     )
 
     matched_ids = [
-
         str(id_map[i])
-
         for i in indices[0]
-
         if i < len(id_map)
     ]
 
@@ -191,94 +212,42 @@ def semantic_search(
         location
     )
 
-    company_lookup = {
-
-        c["id"]: c
-
-        for c in companies
-    }
+    company_lookup = {c["id"]: c for c in companies}
 
     # -----------------------------
-    # Ranking
+    # RANKING
     # -----------------------------
-
     results = []
 
-    for similarity, idx in zip(
-        scores[0],
-        indices[0]
-    ):
+    for similarity, idx in zip(scores[0], indices[0]):
 
         if idx >= len(id_map):
-
             continue
 
-        company_id = str(
-            id_map[idx]
-        )
+        company_id = str(id_map[idx])
 
         if company_id not in company_lookup:
-
             continue
 
-        company = company_lookup[
-            company_id
-        ]
+        company = company_lookup[company_id]
 
         lead_score = max(
             0.0,
-            min(
-                float(
-                    company.get(
-                        "lead_score",
-                        0.0
-                    )
-                ),
-                1.0
-            )
+            min(float(company.get("lead_score", 0.0)), 1.0)
         )
 
         final_score = (
-
-            similarity_weight
-            * float(similarity)
-
-            +
-
-            ranking_weight
-            * lead_score
+            similarity_weight * float(similarity)
+            + ranking_weight * lead_score
         )
 
-        company["similarity_score"] = float(
-            similarity
-        )
+        company["similarity_score"] = float(similarity)
+        company["final_score"] = float(final_score)
 
-        company["final_score"] = float(
-            final_score
-        )
+        results.append((final_score, company))
 
-        results.append(
-            (
-                final_score,
-                company
-            )
-        )
+    results.sort(key=lambda x: x[0], reverse=True)
 
-    results.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
+    paginated = results[offset: offset + limit]
 
-    # -----------------------------
-    # Pagination
-    # -----------------------------
-
-    paginated = results[
-        offset : offset + limit
-    ]
-
-    return (
-        paginated,
-        warning,
-        len(results)
-    )
+    return paginated, warning, len(results)
